@@ -139,6 +139,21 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    pub state: AgentTerminalState,
+    pub kind: AgentTerminalKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTerminalState {
+    Idle,
+    Working,
+    WaitingForInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTerminalKind {
+    Generic,
+    ClaudeCode,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -745,6 +760,8 @@ struct AgentTerminal {
     title_editor_subscription: Option<Subscription>,
     last_known_title: String,
     working_directory: Option<PathBuf>,
+    last_known_state: AgentTerminalState,
+    last_known_kind: AgentTerminalKind,
     created_at: DateTime<Utc>,
     has_notification: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
@@ -778,6 +795,52 @@ impl AgentTerminal {
         }
     }
 
+    fn state(&self, cx: &App) -> AgentTerminalState {
+        let (terminal_title, process_title) = self.terminal_titles(cx);
+
+        if !terminal_title_indicates_claude(&terminal_title, &process_title) {
+            return AgentTerminalState::Idle;
+        }
+
+        let default_state = if terminal_title_indicates_claude_working(&terminal_title) {
+            AgentTerminalState::Working
+        } else {
+            AgentTerminalState::Idle
+        };
+
+        let recent_content = self.recent_terminal_content(cx, 80);
+        infer_claude_terminal_state(&recent_content, default_state)
+    }
+
+    fn kind(&self, cx: &App) -> AgentTerminalKind {
+        let (terminal_title, process_title) = self.terminal_titles(cx);
+        if terminal_title_indicates_claude(&terminal_title, &process_title) {
+            AgentTerminalKind::ClaudeCode
+        } else {
+            AgentTerminalKind::Generic
+        }
+    }
+
+    fn terminal_titles(&self, cx: &App) -> (String, String) {
+        let view = self.view.read(cx);
+        let terminal_entity = view.terminal();
+        let terminal = terminal_entity.read(cx);
+        let terminal_title = if terminal.breadcrumb_text.is_empty() {
+            terminal.title(true)
+        } else {
+            terminal.breadcrumb_text.clone()
+        };
+        let process_title = terminal.title(false);
+        (terminal_title, process_title)
+    }
+
+    fn recent_terminal_content(&self, cx: &App, max_lines: usize) -> String {
+        let view = self.view.read(cx);
+        let terminal_entity = view.terminal();
+        let terminal = terminal_entity.read(cx);
+        terminal.last_n_non_empty_lines(max_lines).join("\n")
+    }
+
     fn refresh_title(&mut self, cx: &mut App) -> bool {
         let title = self.title(cx);
         let changed = self.last_known_title != title.as_ref();
@@ -802,6 +865,70 @@ impl AgentTerminal {
     fn custom_title(&self, cx: &App) -> Option<SharedString> {
         self.view.read(cx).custom_title().map(SharedString::from)
     }
+
+    fn set_state(&mut self, state: AgentTerminalState) -> bool {
+        let changed = self.last_known_state != state;
+        if changed {
+            self.last_known_state = state;
+        }
+        changed
+    }
+
+    fn refresh_kind(&mut self, cx: &App) -> bool {
+        let kind = self.kind(cx);
+        let changed = self.last_known_kind != kind;
+        if changed {
+            self.last_known_kind = kind;
+        }
+        changed
+    }
+
+    fn refresh_state(&mut self, cx: &mut App) -> bool {
+        self.set_state(self.state(cx))
+    }
+
+    fn refresh_entry(&mut self, cx: &mut App) -> bool {
+        let metadata_changed = self.refresh_metadata(cx);
+        let kind_changed = self.refresh_kind(cx);
+        let state_changed = self.refresh_state(cx);
+        metadata_changed || kind_changed || state_changed
+    }
+}
+
+fn terminal_title_indicates_claude(display_title: &str, process_title: &str) -> bool {
+    display_title.to_lowercase().contains("claude")
+        || process_title.to_lowercase().contains("claude")
+}
+
+fn terminal_title_indicates_claude_working(display_title: &str) -> bool {
+    let first_character = display_title
+        .chars()
+        .find(|character| !character.is_whitespace());
+
+    display_title.contains("...")
+        || display_title.contains('…')
+        || first_character.is_some_and(|character| {
+            matches!(character, '·') || ('\u{2800}'..='\u{28ff}').contains(&character)
+        })
+}
+
+fn infer_claude_terminal_state(
+    content: &str,
+    default_active_state: AgentTerminalState,
+) -> AgentTerminalState {
+    let recent_content = recent_terminal_content(content, 80);
+
+    if recent_content.contains("Enter to select") && recent_content.contains("Esc to cancel") {
+        AgentTerminalState::WaitingForInput
+    } else {
+        default_active_state
+    }
+}
+
+fn recent_terminal_content(content: &str, max_lines: usize) -> String {
+    let mut lines = content.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
 }
 
 enum BaseView {
@@ -1807,7 +1934,7 @@ impl AgentPanel {
             &terminal_view,
             move |this, _terminal_view, event: &ItemEvent, cx| match event {
                 ItemEvent::UpdateTab | ItemEvent::UpdateBreadcrumbs => {
-                    this.refresh_terminal_metadata(terminal_id, cx);
+                    this.refresh_terminal_entry(terminal_id, cx);
                 }
                 ItemEvent::CloseItem | ItemEvent::Edit => {}
             },
@@ -1818,10 +1945,9 @@ impl AgentPanel {
             &terminal_entity,
             window,
             move |this, _terminal, event: &TerminalEvent, window, cx| match event {
-                TerminalEvent::TitleChanged
-                | TerminalEvent::Wakeup
-                | TerminalEvent::BreadcrumbsChanged => {
-                    this.refresh_terminal_metadata(terminal_id, cx);
+                TerminalEvent::Wakeup => this.refresh_terminal_activity(terminal_id, cx),
+                TerminalEvent::TitleChanged | TerminalEvent::BreadcrumbsChanged => {
+                    this.refresh_terminal_entry(terminal_id, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::CloseTerminal => {
@@ -1844,6 +1970,8 @@ impl AgentPanel {
                 .unwrap_or_default(),
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
+            last_known_state: AgentTerminalState::Idle,
+            last_known_kind: AgentTerminalKind::Generic,
             has_notification: false,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
@@ -1852,7 +1980,7 @@ impl AgentPanel {
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
         }
-        terminal.refresh_metadata(cx);
+        terminal.refresh_entry(cx);
         self.terminals.insert(terminal_id, terminal);
         self.persist_terminal_metadata(terminal_id, cx);
         self.emit_terminal_thread_started(source, cx);
@@ -1960,9 +2088,9 @@ impl AgentPanel {
         );
     }
 
-    fn refresh_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+    fn refresh_terminal_entry(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id)
-            && terminal.refresh_metadata(cx)
+            && terminal.refresh_entry(cx)
         {
             self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
@@ -2080,6 +2208,10 @@ impl AgentPanel {
             .custom_title
             .clone()
             .or_else(|| (!metadata.title.is_empty()).then(|| metadata.title.clone()))
+    }
+
+    fn refresh_terminal_activity(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        self.refresh_terminal_entry(terminal_id, cx);
     }
 
     fn edit_terminal_title(
@@ -2905,6 +3037,8 @@ impl AgentPanel {
                 has_notification: terminal.has_notification,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
+                state: terminal.last_known_state,
+                kind: terminal.last_known_kind,
             })
             .collect()
     }
@@ -6167,6 +6301,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detects_claude_terminal_waiting_for_input() {
+        assert_eq!(
+            infer_claude_terminal_state(
+                "Claude Code v2.1.143\n\
+                 What would you like me to help you with?\n\
+                 1. Ask me a clarifying question\n\
+                 Enter to select - Up/Down to navigate - Esc to cancel",
+                AgentTerminalState::Working,
+            ),
+            AgentTerminalState::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn detects_active_claude_terminal_without_input_prompt_as_working() {
+        assert_eq!(
+            infer_claude_terminal_state(
+                "Claude Code v2.1.143\n\
+                 Any Claude activity text",
+                AgentTerminalState::Working,
+            ),
+            AgentTerminalState::Working
+        );
+    }
+
+    #[test]
+    fn detects_claude_terminal_without_working_title_as_idle() {
+        assert_eq!(
+            infer_claude_terminal_state(
+                "Claude Code v2.1.143\n\
+                 Haiku 4.5 | zed@main | 0/200k (0%) | effort: med | 0s | rtk 8.9m",
+                AgentTerminalState::Idle,
+            ),
+            AgentTerminalState::Idle
+        );
+    }
+
+    #[test]
+    fn detects_claude_working_title() {
+        assert!(terminal_title_indicates_claude_working(
+            "⠐ Write a 2000-token poem"
+        ));
+        assert!(terminal_title_indicates_claude_working(
+            "· Write a 2000-token poem"
+        ));
+        assert!(terminal_title_indicates_claude_working("Claude Code..."));
+        assert!(!terminal_title_indicates_claude_working("Claude Code"));
+        assert!(!terminal_title_indicates_claude_working(
+            "✳ Write a 2000-token poem"
+        ));
+        assert!(!terminal_title_indicates_claude_working("✻ Claude Code"));
+    }
+
+    #[test]
+    fn ignores_stale_claude_input_prompt() {
+        let mut content = String::from(
+            "Claude Code v2.1.143\n\
+             Enter to select - Up/Down to navigate - Esc to cancel\n",
+        );
+
+        for line_number in 0..100 {
+            content.push_str(&format!("line {line_number}\n"));
+        }
+
+        assert_eq!(
+            infer_claude_terminal_state(&content, AgentTerminalState::Working),
+            AgentTerminalState::Working
+        );
+    }
+
+    #[test]
+    fn detects_claude_process_title() {
+        assert!(terminal_title_indicates_claude("", "zed - claude"));
+        assert!(!terminal_title_indicates_claude(
+            "Ask question",
+            "zed - bash"
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_input_state_updates_on_wakeup(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("claude", false, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.breadcrumb_text = "Claude Code".to_string();
+            terminal.write_output(
+                b"What would you like me to help you with?\n\
+                  1. Ask me a clarifying question\n\
+                  Enter to select - Up/Down to navigate - Esc to cancel",
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            let terminal = panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel");
+            assert_eq!(
+                terminal.last_known_state,
+                AgentTerminalState::WaitingForInput
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_active_thread_serialize_and_load_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
@@ -8519,7 +8777,7 @@ mod tests {
         });
 
         panel.update(&mut cx, |panel, cx| {
-            panel.refresh_terminal_metadata(terminal_id, cx);
+            panel.refresh_terminal_entry(terminal_id, cx)
         });
         cx.run_until_parked();
 

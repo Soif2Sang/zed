@@ -16,10 +16,10 @@ use agent_ui::threads_archive_view::{
     fuzzy_match_positions,
 };
 use agent_ui::{
-    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
-    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewThread,
-    TerminalId, ThreadId, ThreadImportModal, channels_with_threads,
-    import_threads_from_other_channels,
+    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo,
+    AgentTerminalKind, AgentTerminalState, AgentThreadSource, ArchiveSelectedThread,
+    CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewThread, TerminalId, ThreadId,
+    ThreadImportModal, channels_with_threads, import_threads_from_other_channels,
 };
 use chrono::{DateTime, Utc};
 use editor::Editor;
@@ -29,7 +29,8 @@ use feature_flags::{
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle,
     Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
-    WeakEntity, Window, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+    WeakEntity, Window, WindowHandle, hsla, img, linear_color_stop, linear_gradient, list,
+    prelude::*, px,
 };
 use itertools::Itertools;
 use menu::{
@@ -44,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings as _;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -51,7 +53,7 @@ use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, Divider, GradientFade, HighlightedLabel,
-    KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, Tab,
+    KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars,
     ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
     render_modifiers,
 };
@@ -98,6 +100,16 @@ gpui::actions!(
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
+const PROJECT_ICON_FILENAMES: &[&str] = &[
+    "project-icon.png",
+    "project-icon.jpg",
+    "project-icon.jpeg",
+    "project-icon.webp",
+    "project-icon.svg",
+];
+const CLAUDE_LOGO_HUE: f32 = 18.0 / 360.0;
+const CLAUDE_LOGO_SATURATION: f32 = 0.54;
+const CLAUDE_LOGO_LIGHTNESS: f32 = 0.55;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SerializedSidebarView {
@@ -268,6 +280,8 @@ struct TerminalEntry {
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    state: AgentTerminalState,
+    kind: AgentTerminalKind,
     highlight_positions: Vec<usize>,
 }
 
@@ -1238,15 +1252,15 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
-        let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminals_by_id: HashMap<TerminalId, AgentPanelTerminalInfo> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
+                live_terminals_by_id.extend(
                     agent_panel
                         .read(cx)
                         .terminals(cx)
                         .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
+                        .map(|terminal| (terminal.id, terminal)),
                 );
             }
         }
@@ -1309,13 +1323,19 @@ impl Sidebar {
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
+                    let live_terminal = live_terminals_by_id.get(&metadata.terminal_id);
                     let has_notification =
-                        live_notified_terminal_ids.contains(&metadata.terminal_id);
+                        live_terminal.is_some_and(|terminal| terminal.has_notification);
+                    let (state, kind) = live_terminal
+                        .map(|terminal| (terminal.state, terminal.kind))
+                        .unwrap_or((AgentTerminalState::Idle, AgentTerminalKind::Generic));
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
+                        state,
+                        kind,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -1926,6 +1946,65 @@ impl Sidebar {
         )
     }
 
+    fn project_icon_path(project_path: &Path) -> Option<PathBuf> {
+        let icon_dir = project_path.join(".zed");
+        PROJECT_ICON_FILENAMES
+            .iter()
+            .map(|filename| icon_dir.join(filename))
+            .find(|path| path.is_file())
+    }
+
+    fn render_project_path_avatar(project_path: &Path, allow_icon_file: bool) -> AnyElement {
+        if allow_icon_file {
+            if let Some(icon_path) = Self::project_icon_path(project_path) {
+                return img(icon_path)
+                    .size_5()
+                    .flex_none()
+                    .rounded_sm()
+                    .into_any_element();
+            }
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        project_path.hash(&mut hasher);
+        let hue = (hasher.finish() % 360) as f32 / 360.0;
+        let letter = project_path
+            .file_stem()
+            .or_else(|| project_path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project")
+            .chars()
+            .find(|character| character.is_alphanumeric())
+            .map(|character| character.to_uppercase().to_string())
+            .unwrap_or_else(|| "P".to_string());
+
+        h_flex()
+            .size_5()
+            .flex_none()
+            .justify_center()
+            .rounded_sm()
+            .bg(hsla(hue, 0.42, 0.42, 0.44))
+            .child(
+                Label::new(letter)
+                    .size(LabelSize::Small)
+                    .color(Color::Custom(hsla(hue, 0.52, 0.84, 1.0))),
+            )
+            .into_any_element()
+    }
+
+    fn render_project_avatars(&self, key: &ProjectGroupKey) -> AnyElement {
+        let allow_icon_files = key.host().is_none();
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .children(
+                key.path_list()
+                    .ordered_paths()
+                    .map(|path| Self::render_project_path_avatar(path, allow_icon_files)),
+            )
+            .into_any_element()
+    }
+
     fn render_project_header(
         &self,
         ix: usize,
@@ -1957,12 +2036,16 @@ impl Sidebar {
         let key_for_toggle = key.clone();
         let key_for_focus = key.clone();
 
+        let project_avatars = self.render_project_avatars(key);
+
         let label = if highlight_positions.is_empty() {
             Label::new(label.clone())
+                .size(LabelSize::Small)
                 .when(!is_active, |this| this.color(Color::Muted))
                 .into_any_element()
         } else {
             HighlightedLabel::new(label.clone(), highlight_positions.to_vec())
+                .size(LabelSize::Small)
                 .when(!is_active, |this| this.color(Color::Muted))
                 .into_any_element()
         };
@@ -1977,7 +2060,8 @@ impl Sidebar {
         let hover_base = color
             .element_active
             .blend(color.element_background.opacity(0.2));
-        let hover_solid = base_bg.blend(hover_base);
+        let hover_solid = base_bg.blend(hover_base.opacity(0.82));
+        let active_bg = base_bg.blend(color.element_active.opacity(0.64));
 
         let group_name_for_gradient = group_name.clone();
         let gradient_overlay = move || {
@@ -1993,12 +2077,14 @@ impl Sidebar {
             .group(&group_name)
             .cursor_pointer()
             .relative()
-            .h(Tab::content_height(cx))
+            .h(px(34.0))
             .w_full()
+            .mt_0p5()
             .pl_2()
             .pr_1p5()
             .justify_between()
             .border_1()
+            .rounded_sm()
             .map(|this| {
                 if is_focused {
                     this.border_color(color.border_focused)
@@ -2007,12 +2093,22 @@ impl Sidebar {
                 }
             })
             .hover(|s| s.bg(hover_solid))
+            .when(is_active, |this| {
+                this.bg(active_bg)
+                    .border_color(color.border_focused.opacity(0.45))
+            })
             .child(
                 h_flex()
                     .relative()
                     .min_w_0()
                     .w_full()
-                    .gap_1()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(disclosure_icon)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(project_avatars)
                     .child(label)
                     .when_some(
                         self.render_remote_project_icon(ix, host.as_ref()),
@@ -2046,16 +2142,7 @@ impl Sidebar {
                                     .tooltip(Tooltip::text(tooltip_text)),
                             )
                         })
-                    })
-                    .child(
-                        div()
-                            .when(!is_focused, |this| this.visible_on_hover(&group_name))
-                            .child(
-                                Icon::new(disclosure_icon)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    ),
+                    }),
             )
             .child(gradient_overlay())
             .child(
@@ -5443,11 +5530,45 @@ impl Sidebar {
             cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
         );
         let is_remote = terminal.workspace.is_remote(cx);
+        let default_icon = match terminal.kind {
+            AgentTerminalKind::ClaudeCode => IconName::AiClaude,
+            AgentTerminalKind::Generic => IconName::Terminal,
+        };
+        let default_icon_color = match terminal.kind {
+            AgentTerminalKind::ClaudeCode => Color::Custom(hsla(
+                CLAUDE_LOGO_HUE,
+                CLAUDE_LOGO_SATURATION,
+                CLAUDE_LOGO_LIGHTNESS,
+                1.0,
+            )),
+            AgentTerminalKind::Generic => Color::Muted,
+        };
+        let (icon, icon_color, title_color) = match terminal.state {
+            AgentTerminalState::WaitingForInput => (
+                IconName::Warning,
+                Some(Color::Warning),
+                Some(Color::Warning),
+            ),
+            AgentTerminalState::Working => (
+                IconName::LoadCircle,
+                Some(Color::Accent),
+                Some(Color::Accent),
+            ),
+            AgentTerminalState::Idle => (default_icon, Some(default_icon_color), None),
+        };
+        let status = match terminal.state {
+            AgentTerminalState::Idle => AgentThreadStatus::Completed,
+            AgentTerminalState::Working => AgentThreadStatus::Running,
+            AgentTerminalState::WaitingForInput => AgentThreadStatus::WaitingForConfirmation,
+        };
 
         ThreadItem::new(id, terminal.metadata.title.clone())
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(icon)
             .is_remote(is_remote)
+            .status(status)
+            .when_some(icon_color, |this, color| this.icon_color(color))
+            .when_some(title_color, |this, color| this.title_label_color(color))
             .worktrees(worktrees)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
@@ -5907,6 +6028,14 @@ impl Sidebar {
         workspace: &Entity<Workspace>,
         cx: &App,
     ) -> bool {
+        if self
+            .active_entry
+            .as_ref()
+            .is_some_and(|entry| matches!(entry, ActiveEntry::Terminal { workspace: active_workspace, .. } if active_workspace == workspace))
+        {
+            return true;
+        }
+
         workspace
             .read(cx)
             .panel::<AgentPanel>(cx)
