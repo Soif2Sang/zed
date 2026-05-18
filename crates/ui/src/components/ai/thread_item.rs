@@ -522,6 +522,7 @@ impl RenderOnce for ThreadItem {
                 })
                 .child(
                     h_flex()
+                        .relative()
                         .min_w_0()
                         .w_full()
                         .gap_2()
@@ -560,8 +561,11 @@ impl RenderOnce for ThreadItem {
 
                                 this.child(
                                     h_flex()
-                                        .relative()
-                                        .pr_1p5()
+                                        .absolute()
+                                        .right_1()
+                                        .top_0()
+                                        .bottom_0()
+                                        .items_center()
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
                                         })
