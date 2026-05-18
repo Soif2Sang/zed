@@ -4,12 +4,7 @@ use gpui::{
     Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString, pulsating_between,
 };
 use itertools::Itertools as _;
-use std::{
-    env,
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentThreadStatus {
@@ -25,30 +20,6 @@ pub enum WorktreeKind {
     #[default]
     Main,
     Linked,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ThreadItemDesignVariant {
-    #[default]
-    AgentCard,
-    StateFirst,
-}
-
-impl ThreadItemDesignVariant {
-    fn current() -> Self {
-        static VARIANT: OnceLock<ThreadItemDesignVariant> = OnceLock::new();
-
-        *VARIANT.get_or_init(|| match env::var("ZED_THREAD_ITEM_VARIANT") {
-            Ok(variant)
-                if variant.eq_ignore_ascii_case("state-first")
-                    || variant.eq_ignore_ascii_case("state_first")
-                    || variant == "3" =>
-            {
-                ThreadItemDesignVariant::StateFirst
-            }
-            _ => ThreadItemDesignVariant::AgentCard,
-        })
-    }
 }
 
 #[derive(Clone, Default)]
@@ -255,34 +226,15 @@ impl ThreadItem {
 
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let design_variant = ThreadItemDesignVariant::current();
-        let state_first = design_variant == ThreadItemDesignVariant::StateFirst;
         let color = cx.theme().colors();
-        let status_colors = cx.theme().status();
         let sidebar_base_bg = color
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
 
         let raw_bg = self.base_bg.unwrap_or(sidebar_base_bg);
         let apparent_bg = color.background.blend(raw_bg);
-        let status_accent = match self.status {
-            AgentThreadStatus::Running => color.text_accent,
-            AgentThreadStatus::WaitingForConfirmation => status_colors.warning,
-            AgentThreadStatus::Error => status_colors.error,
-            AgentThreadStatus::Completed if self.notified => color.text_accent,
-            AgentThreadStatus::Completed => status_colors.info,
-        };
 
-        let base_bg = if state_first {
-            let bg =
-                apparent_bg.blend(status_accent.opacity(if self.selected { 0.18 } else { 0.08 }));
-
-            if self.selected {
-                bg.blend(color.element_active.opacity(0.54))
-            } else {
-                bg
-            }
-        } else if self.selected {
+        let base_bg = if self.selected {
             apparent_bg.blend(color.element_active.opacity(0.66))
         } else {
             apparent_bg
@@ -291,11 +243,7 @@ impl RenderOnce for ThreadItem {
         let hover_color = color
             .element_active
             .blend(color.element_background.opacity(0.2));
-        let hover_bg = if state_first {
-            base_bg.blend(status_accent.opacity(0.10))
-        } else {
-            apparent_bg.blend(hover_color.opacity(0.7))
-        };
+        let hover_bg = apparent_bg.blend(hover_color.opacity(0.7));
 
         let gradient_overlay = GradientFade::new(base_bg, hover_bg, hover_bg)
             .width(px(64.0))
@@ -312,9 +260,7 @@ impl RenderOnce for ThreadItem {
 
         let icon_id = format!("icon-{}", self.id);
         let icon_visible = self.icon_visible;
-        let icon_chip_bg = if state_first {
-            status_accent.opacity(if self.selected { 0.24 } else { 0.15 })
-        } else if self.selected {
+        let icon_chip_bg = if self.selected {
             color.text_accent.opacity(0.14)
         } else {
             color.element_background.opacity(0.52)
@@ -327,16 +273,10 @@ impl RenderOnce for ThreadItem {
                 .justify_center()
                 .rounded_md()
                 .bg(icon_chip_bg)
-                .when(state_first, |this| {
-                    this.border_1().border_color(status_accent.opacity(0.28))
-                })
                 .when(!icon_visible, |this| this.invisible())
         };
-        let metadata_indent_width = if state_first { 30. } else { 28. };
-        let metadata_indent = move || div().w(px(metadata_indent_width)).flex_none();
-        let icon_color = self.icon_color.unwrap_or(if state_first {
-            Color::Custom(status_accent)
-        } else if self.selected {
+        let metadata_indent = move || div().w(px(28.)).flex_none();
+        let icon_color = self.icon_color.unwrap_or(if self.selected {
             Color::Accent
         } else {
             Color::Muted
@@ -376,11 +316,7 @@ impl RenderOnce for ThreadItem {
                 .child(
                     Icon::new(IconName::LoadCircle)
                         .size(IconSize::Small)
-                        .color(if state_first {
-                            Color::Custom(status_accent)
-                        } else {
-                            Color::Muted
-                        })
+                        .color(Color::Muted)
                         .with_rotate_animation(2),
                 )
                 .into_any_element()
@@ -392,14 +328,7 @@ impl RenderOnce for ThreadItem {
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
-        let title_label_color = self.title_label_color.or_else(|| {
-            state_first.then(|| match self.status {
-                AgentThreadStatus::Running => Color::Accent,
-                AgentThreadStatus::WaitingForConfirmation => Color::Warning,
-                AgentThreadStatus::Error => Color::Error,
-                AgentThreadStatus::Completed => Color::Default,
-            })
-        });
+        let title_label_color = self.title_label_color;
 
         let title_label = if self.title_generating {
             Label::new(title)
@@ -445,8 +374,6 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
-        let show_top_timestamp = state_first && has_timestamp;
-        let show_metadata_timestamp = has_timestamp && !show_top_timestamp;
 
         let show_tooltip = matches!(
             self.status,
@@ -466,25 +393,12 @@ impl RenderOnce for ThreadItem {
             || has_project_paths
             || has_worktree
             || has_diff_stats
-            || show_metadata_timestamp;
+            || has_timestamp;
 
-        let show_status_rail = self.selected || state_first;
-        let status_rail_color = if state_first {
-            status_accent.opacity(if self.selected { 0.88 } else { 0.68 })
-        } else {
-            color.text_accent.opacity(0.68)
-        };
+        let show_status_rail = self.selected;
+        let status_rail_color = color.text_accent.opacity(0.68);
         let border_color = if self.selected {
-            if state_first {
-                status_accent.opacity(0.50)
-            } else {
-                color.border_focused.opacity(0.42)
-            }
-        } else if state_first
-            && (self.status == AgentThreadStatus::Error
-                || self.status == AgentThreadStatus::WaitingForConfirmation)
-        {
-            status_accent.opacity(0.22)
+            color.border_focused.opacity(0.42)
         } else {
             gpui::transparent_black()
         };
@@ -515,7 +429,7 @@ impl RenderOnce for ThreadItem {
                             .left_0()
                             .top_1()
                             .bottom_1()
-                            .w(if state_first { px(3.) } else { px(2.) })
+                            .w(px(2.))
                             .rounded_r_sm()
                             .bg(status_rail_color),
                     )
@@ -543,13 +457,6 @@ impl RenderOnce for ThreadItem {
                                         .child(title_label),
                                 ),
                         )
-                        .when(show_top_timestamp, |this| {
-                            this.child(
-                                Label::new(timestamp.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        })
                         .child(gradient_overlay)
                         .when(self.hovered, |this| {
                             this.when_some(self.action_slot, |this, slot| {
@@ -656,11 +563,6 @@ impl RenderOnce for ThreadItem {
                                             h_flex()
                                                 .min_w_0()
                                                 .gap_0p5()
-                                                .when(state_first, |this| {
-                                                    this.px_1()
-                                                        .rounded_sm()
-                                                        .bg(color.element_background.opacity(0.34))
-                                                })
                                                 .child(
                                                     Icon::new(chip_icon)
                                                         .size(IconSize::XSmall)
@@ -686,16 +588,16 @@ impl RenderOnce for ThreadItem {
                             )
                             .when(
                                 (has_project_name || has_project_paths || has_worktree)
-                                    && (has_diff_stats || show_metadata_timestamp),
+                                    && (has_diff_stats || has_timestamp),
                                 |this| this.child(dot_separator()),
                             )
                             .when(has_diff_stats, |this| {
                                 this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
                             })
-                            .when(has_diff_stats && show_metadata_timestamp, |this| {
+                            .when(has_diff_stats && has_timestamp, |this| {
                                 this.child(dot_separator())
                             })
-                            .when(show_metadata_timestamp, |this| {
+                            .when(has_timestamp, |this| {
                                 this.child(
                                     Label::new(timestamp.clone())
                                         .size(LabelSize::Small)
