@@ -797,8 +797,9 @@ impl AgentTerminal {
 
     fn state(&self, cx: &App) -> AgentTerminalState {
         let (terminal_title, process_title) = self.terminal_titles(cx);
+        let recent_content = self.recent_terminal_content(cx, 80);
 
-        if !terminal_title_indicates_claude(&terminal_title, &process_title) {
+        if !terminal_indicates_claude(&terminal_title, &process_title, &recent_content) {
             return AgentTerminalState::Idle;
         }
 
@@ -808,13 +809,13 @@ impl AgentTerminal {
             AgentTerminalState::Idle
         };
 
-        let recent_content = self.recent_terminal_content(cx, 80);
         infer_claude_terminal_state(&recent_content, default_state)
     }
 
     fn kind(&self, cx: &App) -> AgentTerminalKind {
         let (terminal_title, process_title) = self.terminal_titles(cx);
-        if terminal_title_indicates_claude(&terminal_title, &process_title) {
+        let recent_content = self.recent_terminal_content(cx, 80);
+        if terminal_indicates_claude(&terminal_title, &process_title, &recent_content) {
             AgentTerminalKind::ClaudeCode
         } else {
             AgentTerminalKind::Generic
@@ -900,6 +901,11 @@ fn terminal_title_indicates_claude(display_title: &str, process_title: &str) -> 
         || process_title.to_lowercase().contains("claude")
 }
 
+fn terminal_indicates_claude(display_title: &str, process_title: &str, content: &str) -> bool {
+    terminal_title_indicates_claude(display_title, process_title)
+        || claude_terminal_content_indicates_claude(content)
+}
+
 fn terminal_title_indicates_claude_working(display_title: &str) -> bool {
     let first_character = display_title
         .chars()
@@ -918,11 +924,34 @@ fn infer_claude_terminal_state(
 ) -> AgentTerminalState {
     let recent_content = recent_terminal_content(content, 80);
 
-    if recent_content.contains("Enter to select") && recent_content.contains("Esc to cancel") {
+    if claude_terminal_content_indicates_waiting_for_input(&recent_content) {
         AgentTerminalState::WaitingForInput
     } else {
         default_active_state
     }
+}
+
+fn claude_terminal_content_indicates_waiting_for_input(content: &str) -> bool {
+    let selection_prompt = content.contains("Enter to select") && content.contains("Esc to cancel");
+    let permission_prompt =
+        content.contains("Do you want to proceed?") && content.contains("Esc to cancel");
+
+    selection_prompt || permission_prompt
+}
+
+fn claude_terminal_content_indicates_claude(content: &str) -> bool {
+    let permission_prompt = content.contains("Do you want to proceed?")
+        && content.contains("Tab to amend")
+        && content.contains("ctrl+e to explain");
+    let skill_selection_prompt = content.contains("Current Task")
+        && content.contains("Enter to select")
+        && content.contains("Esc to cancel");
+
+    content.contains("Claude Code")
+        || content.contains("Claude Team")
+        || content.contains("Cogitated for")
+        || permission_prompt
+        || skill_selection_prompt
 }
 
 fn recent_terminal_content(content: &str, max_lines: usize) -> String {
@@ -5049,9 +5078,17 @@ impl AgentPanel {
         let can_create_entries = self.has_open_project(cx);
         let supports_terminal = self.supports_terminal(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
+        let active_terminal_kind = self
+            .active_terminal_id()
+            .and_then(|terminal_id| self.terminals.get(&terminal_id))
+            .map(|terminal| terminal.last_known_kind);
 
         let (selected_agent_custom_icon, selected_agent_label) = if showing_terminal {
-            (None, SharedString::from("Terminal"))
+            let label = match active_terminal_kind {
+                Some(AgentTerminalKind::ClaudeCode) => SharedString::from("Claude Code"),
+                Some(AgentTerminalKind::Generic) | None => SharedString::from("Terminal"),
+            };
+            (None, label)
         } else if let Agent::Custom { id, .. } = &self.selected_agent {
             let store = agent_server_store.read(cx);
             let icon = store.agent_icon(&id);
@@ -5286,7 +5323,10 @@ impl AgentPanel {
         let has_custom_icon = selected_agent_custom_icon.is_some();
         let selected_agent_custom_icon_for_button = selected_agent_custom_icon.clone();
         let selected_agent_builtin_icon = if showing_terminal {
-            Some(IconName::Terminal)
+            Some(match active_terminal_kind {
+                Some(AgentTerminalKind::ClaudeCode) => IconName::AiClaude,
+                Some(AgentTerminalKind::Generic) | None => IconName::Terminal,
+            })
         } else {
             self.selected_agent.icon()
         };
@@ -6316,6 +6356,24 @@ mod tests {
     }
 
     #[test]
+    fn detects_claude_terminal_permission_prompt_waiting_for_input() {
+        assert_eq!(
+            infer_claude_terminal_state(
+                "Bash command\n\
+                 ~/.local/share/pypoetry/venv/bin/poetry run pytest tests/api/test_conversations.py\n\
+                 Run tests using full poetry path\n\
+                 Do you want to proceed?\n\
+                 > 1. Yes\n\
+                   2. Yes, and don't ask again for ~/.local/share/pypoetry/venv/bin/poetry run *\n\
+                   3. No\n\
+                 Esc to cancel · Tab to amend · ctrl+e to explain",
+                AgentTerminalState::Idle,
+            ),
+            AgentTerminalState::WaitingForInput
+        );
+    }
+
+    #[test]
     fn detects_active_claude_terminal_without_input_prompt_as_working() {
         assert_eq!(
             infer_claude_terminal_state(
@@ -6373,12 +6431,105 @@ mod tests {
     }
 
     #[test]
+    fn ignores_stale_claude_permission_prompt() {
+        let mut content = String::from(
+            "Bash command\n\
+             Do you want to proceed?\n\
+             Esc to cancel · Tab to amend · ctrl+e to explain\n",
+        );
+
+        for line_number in 0..100 {
+            content.push_str(&format!("line {line_number}\n"));
+        }
+
+        assert_eq!(
+            infer_claude_terminal_state(&content, AgentTerminalState::Working),
+            AgentTerminalState::Working
+        );
+    }
+
+    #[test]
     fn detects_claude_process_title() {
         assert!(terminal_title_indicates_claude("", "zed - claude"));
         assert!(!terminal_title_indicates_claude(
             "Ask question",
             "zed - bash"
         ));
+    }
+
+    #[test]
+    fn detects_claude_from_recent_terminal_content() {
+        assert!(terminal_indicates_claude(
+            "zed - zsh",
+            "zed - zsh",
+            "Claude Code v2.1.147\nHaiku 4.5 • Claude Team"
+        ));
+        assert!(terminal_indicates_claude(
+            "Terminal",
+            "zed - zsh",
+            "Bash command\n\
+             ./script/clippy 2>&1 | head -20\n\
+             Run the project's clippy linter\n\
+             Do you want to proceed?\n\
+             > 1. Yes\n\
+               2. Yes, and don't ask again for: ./script/clippy\n\
+               3. No\n\
+             Esc to cancel · Tab to amend · ctrl+e to explain"
+        ));
+        assert!(!terminal_indicates_claude(
+            "Terminal",
+            "zed - zsh",
+            "Do you want to proceed?\nEsc to cancel"
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_kind_and_state_update_from_content_without_claude_title(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("zed - zsh", false, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+
+        terminal.update(&mut cx, |terminal, cx| {
+            terminal.write_output(
+                b"Claude Code v2.1.147\n\
+                  Haiku 4.5 - Claude Team\n\
+                  Current Task\n\
+                  What would you like to work on?\n\
+                  > 1. Continue agent terminal status work\n\
+                  Enter to select - Up/Down to navigate - Esc to cancel",
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            let terminal = panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel");
+            assert_eq!(terminal.last_known_kind, AgentTerminalKind::ClaudeCode);
+            assert_eq!(
+                terminal.last_known_state,
+                AgentTerminalState::WaitingForInput
+            );
+        });
     }
 
     #[gpui::test]
